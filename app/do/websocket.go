@@ -3,12 +3,16 @@ package do
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -40,79 +44,213 @@ type WebsocketUdpdata struct {
 
 var wsConfig *lib.Config
 
-// DoWebsocket 启动WebSocket连接和数据处理
-func DoWebsocket(cfg *lib.Config) {
-	wsConfig = cfg
+type wsURLPool struct {
+	mu   sync.RWMutex
+	urls []string
+}
 
-	// WebSocket URL
-	// wsURL := "ws://ws3.9999j.cn/ws/market_all/jc.9999j.cn/15814600700?t=TU47O23W542F60b4Ad8ao9ql7Nq4JB5eg5bM76D1Kia2X"
-	wsURL := wsConfig.WSURL
+func (p *wsURLPool) Set(urls []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.urls = append([]string(nil), urls...)
+}
 
-	// 创建中断信号通道，用于优雅退出
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
+func (p *wsURLPool) GetAll() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return append([]string(nil), p.urls...)
+}
 
-	log.Println("正在连接到WebSocket服务器...")
-
-	// 连接到WebSocket服务器
-	c, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		log.Fatal("连接失败:", err)
+func getWSHost(cfg *lib.Config) string {
+	if strings.TrimSpace(cfg.WSHost) != "" {
+		return strings.TrimSpace(cfg.WSHost)
 	}
-	defer c.Close()
+	return "www.9999j.cn"
+}
 
-	log.Println("连接成功")
+func getWSDiscoverURL(cfg *lib.Config) string {
+	if strings.TrimSpace(cfg.WSDiscoverURL) != "" {
+		return strings.TrimSpace(cfg.WSDiscoverURL)
+	}
+	return "http://www.9999j.cn/m2"
+}
 
-	// 创建一个通道用于接收消息
-	done := make(chan struct{})
+func getWSRefreshSec(cfg *lib.Config) time.Duration {
+	if cfg.WSRefreshSec > 0 {
+		return time.Duration(cfg.WSRefreshSec) * time.Second
+	}
+	return 300 * time.Second
+}
 
-	// 存储最新的筛选数据
-	// lastFilteredData := make(map[string]MarketData)
+func getWSReconnectSec(cfg *lib.Config) time.Duration {
+	if cfg.WSReconnectSec > 0 {
+		return time.Duration(cfg.WSReconnectSec) * time.Second
+	}
+	return 3 * time.Second
+}
 
-	// 启动一个goroutine来接收消息
+func fetchWSURLs(cfg *lib.Config) ([]string, error) {
+	resp, err := http.Get(getWSDiscoverURL(cfg))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("discover status code: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	re := regexp.MustCompile(`var\s+domains\s*=\s*'([^']+)'`)
+	matches := re.FindStringSubmatch(string(body))
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("domains not found in discover page")
+	}
+
+	host := getWSHost(cfg)
+	rawDomains := strings.Split(matches[1], ",")
+	seen := make(map[string]struct{})
+	urls := make([]string, 0, len(rawDomains))
+	for _, d := range rawDomains {
+		domain := strings.TrimSpace(d)
+		if domain == "" {
+			continue
+		}
+		url := fmt.Sprintf("ws://%s/ws/market/%s", domain, host)
+		if _, ok := seen[url]; ok {
+			continue
+		}
+		seen[url] = struct{}{}
+		urls = append(urls, url)
+	}
+
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("no websocket urls generated")
+	}
+
+	return urls, nil
+}
+
+func refreshWSURLs(pool *wsURLPool, cfg *lib.Config) {
+	urls, err := fetchWSURLs(cfg)
+	if err != nil {
+		log.Println("刷新WS地址失败:", err)
+		return
+	}
+	pool.Set(urls)
+	wsLogIfEnabled("WS地址刷新成功，数量:", len(urls))
+}
+
+func runWSSession(c *websocket.Conn, interrupt <-chan os.Signal) error {
+	done := make(chan error, 1)
+
 	go func() {
-		defer close(done)
 		for {
 			_, message, err := c.ReadMessage()
 			if err != nil {
-				log.Println("读取消息错误:", err)
+				done <- err
 				return
 			}
-
-			// 处理接收到的消息
-			// handleWsMessage(message, lastFilteredData)
 			handleWsMessage(message)
 		}
 	}()
 
-	// 每秒发送一次消息
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-done:
-			return
+		case err := <-done:
+			return err
 		case <-ticker.C:
-			err := c.WriteMessage(websocket.TextMessage, []byte("jc.9999j.cn"))
-			if err != nil {
-				log.Println("发送消息错误:", err)
-				return
+			if err := c.WriteMessage(websocket.TextMessage, []byte("jc.9999j.cn")); err != nil {
+				return err
 			}
 		case <-interrupt:
-			log.Println("接收到中断信号，正在关闭连接...")
-
-			// 关闭WebSocket连接
-			err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			if err != nil {
-				log.Println("关闭连接错误:", err)
-			}
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-			}
-			return
+			_ = c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			return nil
 		}
+	}
+}
+
+// DoWebsocket 启动WebSocket连接和数据处理
+func DoWebsocket(cfg *lib.Config) {
+	wsConfig = cfg
+
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+
+	pool := &wsURLPool{}
+	if urls, err := fetchWSURLs(cfg); err == nil {
+		pool.Set(urls)
+		wsLogIfEnabled("初始化WS地址成功，数量:", len(urls))
+	} else {
+		log.Println("初始化抓取WS地址失败:", err)
+		if strings.TrimSpace(wsConfig.WSURL) != "" {
+			pool.Set([]string{strings.TrimSpace(wsConfig.WSURL)})
+			log.Println("使用配置ws_url作为兜底地址")
+		}
+	}
+
+	go func() {
+		ticker := time.NewTicker(getWSRefreshSec(cfg))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				refreshWSURLs(pool, cfg)
+			case <-interrupt:
+				return
+			}
+		}
+	}()
+
+	reconnectDelay := getWSReconnectSec(cfg)
+
+	for {
+		select {
+		case <-interrupt:
+			log.Println("接收到中断信号，停止WebSocket处理")
+			return
+		default:
+		}
+
+		urls := pool.GetAll()
+		if len(urls) == 0 {
+			log.Println("当前无可用WS地址，等待后重试")
+			time.Sleep(reconnectDelay)
+			refreshWSURLs(pool, cfg)
+			continue
+		}
+
+		connected := false
+		for _, wsURL := range urls {
+			log.Println("正在连接到WebSocket服务器:", wsURL)
+			c, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			if err != nil {
+				log.Println("连接失败:", err)
+				continue
+			}
+
+			connected = true
+			log.Println("连接成功:", wsURL)
+			err = runWSSession(c, interrupt)
+			c.Close()
+
+			if err == nil {
+				return
+			}
+			log.Println("连接中断，准备切换下一个地址:", err)
+		}
+
+		if !connected {
+			log.Println("本轮所有WS地址连接失败")
+		}
+		time.Sleep(reconnectDelay)
 	}
 }
 

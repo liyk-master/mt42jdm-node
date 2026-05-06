@@ -8,8 +8,12 @@ import (
 )
 
 type Config struct {
-	WSURL  string `json:"ws_url"`
-	Output bool   `json:"output"`
+	WSURL        string `json:"ws_url"`
+	WSDiscoverURL string `json:"ws_discover_url"`
+	WSHost       string `json:"ws_host"`
+	WSRefreshSec int    `json:"ws_refresh_sec"`
+	WSReconnectSec int  `json:"ws_reconnect_sec"`
+	Output       bool   `json:"output"`
 	Mysql  struct {
 		Host     string `json:"host"`
 		Port     int    `json:"port"`
