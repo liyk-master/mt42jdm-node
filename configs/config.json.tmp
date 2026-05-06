@@ -1,5 +1,9 @@
 {
   "ws_url": "ws://s0204.9999j.cn:9999/ws/market/www.9999j.cn?t=null",
+  "ws_discover_url": "http://www.9999j.cn/m2",
+  "ws_host": "www.9999j.cn",
+  "ws_refresh_sec": 300,
+  "ws_reconnect_sec": 3,
   "output": true,
   "udp_server": ""
 }
