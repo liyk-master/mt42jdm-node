@@ -44,6 +44,12 @@ type WebsocketUdpdata struct {
 
 var wsConfig *lib.Config
 
+const defaultUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
 type wsURLPool struct {
 	mu   sync.RWMutex
 	urls []string
@@ -90,7 +96,16 @@ func getWSReconnectSec(cfg *lib.Config) time.Duration {
 }
 
 func fetchWSURLs(cfg *lib.Config) ([]string, error) {
-	resp, err := http.Get(getWSDiscoverURL(cfg))
+	req, err := http.NewRequest("GET", getWSDiscoverURL(cfg), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", defaultUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Referer", "http://www.9999j.cn/")
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -104,11 +119,14 @@ func fetchWSURLs(cfg *lib.Config) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(body) == 0 {
+		return nil, fmt.Errorf("discover response body is empty")
+	}
 
 	re := regexp.MustCompile(`var\s+domains\s*=\s*'([^']+)'`)
 	matches := re.FindStringSubmatch(string(body))
 	if len(matches) < 2 {
-		return nil, fmt.Errorf("domains not found in discover page")
+		return nil, fmt.Errorf("domains not found in discover page, body len=%d", len(body))
 	}
 
 	host := getWSHost(cfg)
@@ -210,6 +228,8 @@ func DoWebsocket(cfg *lib.Config) {
 	}()
 
 	reconnectDelay := getWSReconnectSec(cfg)
+	maxBackoff := 300 * time.Second
+	var httpFailCount, wsFailCount int
 
 	for {
 		select {
@@ -221,9 +241,19 @@ func DoWebsocket(cfg *lib.Config) {
 
 		urls := pool.GetAll()
 		if len(urls) == 0 {
-			log.Println("当前无可用WS地址，等待后重试")
-			time.Sleep(reconnectDelay)
+			backoff := time.Duration(1<<min(httpFailCount, 6)) * reconnectDelay
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			log.Printf("当前无可用WS地址，%.0f秒后重试 (连续失败%d次)", backoff.Seconds(), httpFailCount)
+			time.Sleep(backoff)
+
 			refreshWSURLs(pool, cfg)
+			if pool.GetAll() == nil || len(pool.GetAll()) == 0 {
+				httpFailCount++
+			} else {
+				httpFailCount = 0
+			}
 			continue
 		}
 
@@ -237,6 +267,7 @@ func DoWebsocket(cfg *lib.Config) {
 			}
 
 			connected = true
+			wsFailCount = 0
 			log.Println("连接成功:", wsURL)
 			err = runWSSession(c, interrupt)
 			c.Close()
@@ -248,9 +279,16 @@ func DoWebsocket(cfg *lib.Config) {
 		}
 
 		if !connected {
-			log.Println("本轮所有WS地址连接失败")
+			wsFailCount++
+			backoff := time.Duration(1<<min(wsFailCount-1, 5)) * reconnectDelay
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			log.Printf("本轮所有WS地址连接失败，%.0f秒后重试 (连续失败%d轮)", backoff.Seconds(), wsFailCount)
+			time.Sleep(backoff)
+		} else {
+			time.Sleep(reconnectDelay)
 		}
-		time.Sleep(reconnectDelay)
 	}
 }
 
